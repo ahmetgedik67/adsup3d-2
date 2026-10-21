@@ -1,235 +1,109 @@
-// local3d.js — Yerel 3D motor (sunucu yok, kota yok, anahtar yok)
-// Akış: transformers.js (WebGPU varsa /yoksa WASM) ile
-//   1) depth-anything-v2-small → derinlik haritası
-//   2) Xenova/modnet → ön plan maskesi (arka plan kesilir)
-//   3) three.js ile maskeli, renkli (texture = görselin kendisi) rölyef mesh
-//   4) GLTFExporter ile .glb blob üretir → app.js aynı akışta gösterir/indirir.
-// İlk kullanımda model dosyaları indirilir (~26 MB) ve tarayıcı önbelleğine alınır.
+// local3d.js — tamamı tarayıcıda çalışan, kotasız renkli 2.5D kabartma motoru
+// Görselin kenar renklerini arka plan olarak tahmin eder; renk/ışık farkını derinliğe
+// dönüştürür ve Three.js ile texture'lı bir GLB üretir.
 
 import * as THREE from "three";
 import { GLTFExporter } from "three/addons/exporters/GLTFExporter.js";
 
-const TJS = "https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.8.1";
+let progressLog = null;
+export function local3dProgress(cb) { progressLog = cb || null; }
+const notify = (message) => { if (progressLog) progressLog(message); };
 
-let tjs = null,
-  depthPipe = null,
-  cutPipe = null;
-
-export function local3dProgress(cb) {
-  _progressLog = cb || null;
-}
-let _progressLog = null;
-
-async function loadTJS() {
-  if (tjs) return tjs;
-  tjs = await import(/* @vite-ignore */ TJS);
-  return tjs;
+function samplePixel(data, width, x, y) {
+  const i = (Math.max(0, y) * width + Math.max(0, x)) * 4;
+  return [data[i], data[i + 1], data[i + 2], data[i + 3]];
 }
 
-function notify(msg) {
-  if (_progressLog) _progressLog(msg);
+function colorDistance(a, b) {
+  const dr = a[0] - b[0], dg = a[1] - b[1], db = a[2] - b[2];
+  return Math.sqrt(dr * dr + dg * dg + db * db) / 441.7;
 }
 
-async function getDepthPipe() {
-  if (depthPipe) return depthPipe;
-  const { pipeline } = await loadTJS();
-  const MODEL = "onnx-community/depth-anything-v2-small";
-  const opts = {
-    progress_callback: (p) => {
-      if (p && p.status === "progress") notify(`Yerel motor: ${Math.round(p.loaded / 1e6)}/${p.total ? Math.round(p.total / 1e6) + " MB" : "?"} — ${p.file || ""}`);
-    }
-  };
-  if (navigator.gpu) {
-    for (const dtype of ["q4f16", "fp16"]) {
-      try {
-        depthPipe = await pipeline("depth-estimation", MODEL, { ...opts, device: "webgpu", dtype });
-        notify("Yerel motor: WebGPU hazır (" + dtype + ")");
-        return depthPipe;
-      } catch (e) { /* sıradaki dtype */ }
-    }
-    notify("WebGPU kullanılamadı — WASM'a geçiliyor (biraz yavaş)");
-  }
-  for (const dtype of ["q8", "fp32"]) {
-    try {
-      depthPipe = await pipeline("depth-estimation", MODEL, { ...opts, device: "wasm", dtype });
-      notify("Yerel motor: WASM hazır (" + dtype + ")");
-      return depthPipe;
-    } catch (e) { /* sıradaki dtype */ }
-  }
-  throw new Error("Yerel derinlik modeli yüklenemedi");
-}
-
-async function getCutPipe() {
-  if (cutPipe) return cutPipe;
-  const { pipeline } = await loadTJS();
-  const opts = {
-    progress_callback: (p) => {
-      if (p && p.status === "progress") notify(`Yerel motor: kesme modeli ${Math.round(p.loaded / 1e6)}/${p.total ? Math.round(p.total / 1e6) + " MB" : "?"}`);
-    }
-  };
-  if (navigator.gpu) {
-    try {
-      cutPipe = await pipeline("background-removal", "Xenova/modnet", { ...opts, device: "webgpu", dtype: "fp16" });
-      return cutPipe;
-    } catch (e) { /* wasm'a düş */ }
-  }
-  cutPipe = await pipeline("background-removal", "Xenova/modnet", { ...opts, device: "wasm", dtype: "q8" });
-  return cutPipe;
-}
-
-// Ana giriş: File/Blob → renkli .glb Blob
 export async function generateLocal3D(file) {
-  notify("Yerel 3D motor başlatılıyor (tarayızda, sunucu yok)…");
-  const { RawImage } = await loadTJS();
-  const img = await RawImage.fromBlob(file);
+  notify("Görsel cihazda analiz ediliyor…");
+  const bitmap = await createImageBitmap(file);
+  const maxSide = 512;
+  const scale = Math.min(1, maxSide / Math.max(bitmap.width, bitmap.height));
+  const W = Math.max(2, Math.round(bitmap.width * scale));
+  const H = Math.max(2, Math.round(bitmap.height * scale));
+  const canvas = document.createElement("canvas");
+  canvas.width = W; canvas.height = H;
+  const ctx = canvas.getContext("2d", { willReadFrequently: true });
+  ctx.drawImage(bitmap, 0, 0, W, H);
+  bitmap.close();
+  const pixels = ctx.getImageData(0, 0, W, H).data;
 
-  const [depthPipeP, cutPipeP] = [getDepthPipe(), getCutPipe()];
-  const cutOut = await (await cutPipeP)(img);
-  const cutRaw = Array.isArray(cutOut) ? cutOut[0] : cutOut;   // RGBA RawImage (ön plan)
-  if (!cutRaw || !cutRaw.width) throw new Error("Ön plan kesme başarısız");
-  const cut = cutRaw;
-  const depthRes = await (await depthPipeP)(img); // { predicted_depth, depth: RawImage(1ch) }
-  let depthImg = depthRes.depth;
+  const corners = [samplePixel(pixels, W, 0, 0), samplePixel(pixels, W, W - 1, 0), samplePixel(pixels, W, 0, H - 1), samplePixel(pixels, W, W - 1, H - 1)];
+  const bg = [0, 1, 2, 3].map((c) => corners.reduce((sum, p) => sum + p[c], 0) / corners.length);
+  const strength = new Float32Array(W * H);
+  let active = 0;
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+    const p = samplePixel(pixels, W, x, y);
+    const alpha = p[3] / 255;
+    const diff = colorDistance(p, bg);
+    const s = bg[3] < 245 ? alpha : Math.max(0, Math.min(1, (diff - 0.035) / 0.22)) * alpha;
+    strength[y * W + x] = s;
+    if (s > 0.12) active++;
+  }
+  const useWholeImage = active < W * H * 0.025;
+  if (useWholeImage) strength.fill(1);
 
-  // Derinliği kesme görüntüsünün boyutuna hizala
-  const W = cut.width, H = cut.height;
-  if (depthImg.width !== W || depthImg.height !== H) depthImg = depthImg.resize(W, H);
-
-  const maskData = cut.data;     // RGBA
-  const dData = depthImg.data;   // 1 kanal
-
-  // Ön plan yoğunluğu: alpha>~45 piksel, arka plan alpha ~0
-  // Maske yumuşatma: basit 1-adım box blur alpha kanalına
-  const softA = new Float32Array(W * H);
-  for (let y = 0; y < H; y++) {
-    for (let x = 0; x < W; x++) {
-      const i = (y * W + x) * 4 + 3;
-      let a = maskData[i];
-      if (x > 0) a += maskData[i - 4];
-      if (x < W - 1) a += maskData[i + 4];
-      if (y > 0) a += maskData[i - 4 * W];
-      if (y < H - 1) a += maskData[i + 4 * W];
-      softA[y * W + x] = a / 5;
+  let x0 = W - 1, y0 = H - 1, x1 = 0, y1 = 0;
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+    if (strength[y * W + x] > 0.12) {
+      x0 = Math.min(x0, x); y0 = Math.min(y0, y); x1 = Math.max(x1, x); y1 = Math.max(y1, y);
     }
   }
+  if (x1 <= x0 || y1 <= y0) { x0 = 0; y0 = 0; x1 = W - 1; y1 = H - 1; }
+  const pad = Math.max(3, Math.round(Math.max(x1 - x0, y1 - y0) * 0.04));
+  x0 = Math.max(0, x0 - pad); y0 = Math.max(0, y0 - pad);
+  x1 = Math.min(W - 1, x1 + pad); y1 = Math.min(H - 1, y1 + pad);
 
-  // Konu bbox
-  let x0 = W, y0 = H, x1 = 0, y1 = 0;
-  for (let y = 0; y < H; y++)
-    for (let x = 0; x < W; x++)
-      if (softA[y * W + x] > 90) {
-        if (x < x0) x0 = x; if (x > x1) x1 = x;
-        if (y < y0) y0 = y; if (y > y1) y1 = y;
-      }
-  if (x1 <= x0 || y1 <= y0) throw new Error("Ön plan bulunamadı — görselde ana nesne belirgin mi?");
-  // kenar payı
-  const padX = Math.max(4, Math.round((x1 - x0) * 0.03));
-  const padY = Math.max(4, Math.round((y1 - y0) * 0.03));
-  x0 = Math.max(0, x0 - padX); y0 = Math.max(0, y0 - padY);
-  x1 = Math.min(W - 1, x1 + padX); y1 = Math.min(H - 1, y1 + padY);
-
-  // Konu derinlik aralığı (dışarıyı yok say)
-  let dMin = 1e9, dMax = -1e9;
-  for (let y = y0; y <= y1; y++)
-    for (let x = x0; x <= x1; x++)
-      if (softA[y * W + x] > 150) {
-        const d = dData[y * W + x];
-        if (d < dMin) dMin = d;
-        if (d > dMax) dMax = d;
-      }
-  if (!(dMax > dMin)) { dMin = 0; dMax = 255; }
-
-  // Grid mesh
-  const N = 150; // 150×150 grid → hızlı ve yeterli
-  const bw = x1 - x0, bh = y1 - y0;
-  const relH = 0.55; // wçz rölyef yüksekliği (birim: genişlik=1)
-  const pos = [], uv = [], idx = [], alphaCols = new Float32Array((N + 1) * (N + 1));
-
-  const sample = (data, channels, px, py) => {
-    const cx = Math.max(0, Math.min(W - 1, px)), cy = Math.max(0, Math.min(H - 1, py));
-    const i = (cy * W + cx) * channels;
-    return data[i];
-  };
-
-  let vi = 0;
-  for (let j = 0; j <= N; j++) {
-    for (let i2 = 0; i2 <= N; i2++) {
-      const fx = x0 + (i2 / N) * bw;
-      const fy = y0 + (j / N) * bh;
-      const cx = Math.round(fx), cy = Math.round(fy);
-      // 3×3 alpha ortalaması (hücre düzleştirme)
-      let a = 0, n = 0;
-      for (let dy = -1; dy <= 1; dy++)
-        for (let dx = -1; dx <= 1; dx++) {
-          const ok = cy + dy >= 0 && cy + dy < H && cx + dx >= 0 && cx + dx < W;
-          if (ok) { a += softA[(cy + dy) * W + (cx + dx)]; n++; }
-        }
-      a /= n; alphaCols[j * (N + 1) + i2] = a;
-
-      const dRaw = sample(dData, 1, cx, cy);
-      // depth-anything: daha büyük değer = daha yakın → rölyef şişkinliği için t kullan
-      const t = Math.max(0, Math.min(1, (dRaw - dMin) / (dMax - dMin)));
-      pos.push(
-        (fx / W - (x0 + x1) / (2 * W)) * 1.0,          // x: konu merkezli, genişlik 1
-        -(fy / H - (y0 + y1) / (2 * H)) * (bh / bw),   // y: en-boy oranına göre
-        t * relH                                        // z: derinlik rölyefi
-      );
-      uv.push(fx / W, 1 - fy / H);
-      vi++;
-    }
+  notify("Renklerden derinlik haritası oluşturuluyor…");
+  const N = 128, bw = x1 - x0, bh = y1 - y0;
+  const positions = [], uvs = [], indices = [], masks = new Float32Array((N + 1) * (N + 1));
+  for (let j = 0; j <= N; j++) for (let i = 0; i <= N; i++) {
+    const u = i / N, v = j / N;
+    const px = Math.round(x0 + u * bw), py = Math.round(y0 + v * bh);
+    const p = samplePixel(pixels, W, px, py);
+    const mask = strength[py * W + px];
+    masks[j * (N + 1) + i] = mask;
+    const luminance = (0.2126 * p[0] + 0.7152 * p[1] + 0.0722 * p[2]) / 255;
+    const dome = Math.sin(Math.PI * u) * Math.sin(Math.PI * v);
+    const detail = (0.5 - luminance) * 0.10;
+    const depth = (0.10 + dome * 0.22 + detail) * (useWholeImage ? 1 : Math.max(0.15, mask));
+    positions.push(u - 0.5, (0.5 - v) * (bh / bw), depth);
+    uvs.push(px / W, 1 - py / H);
   }
-
-  // Yüzler: 4 köşesi de ön plan olan hücreler
-  for (let j = 0; j < N; j++) {
-    for (let i2 = 0; i2 < N; i2++) {
-      const a1 = alphaCols[j * (N + 1) + i2], a2 = alphaCols[j * (N + 1) + i2 + 1],
-        a3 = alphaCols[(j + 1) * (N + 1) + i2], a4 = alphaCols[(j + 1) * (N + 1) + i2 + 1];
-      if (a1 > 120 && a2 > 120 && a3 > 120 && a4 > 120) {
-        const tl = j * (N + 1) + i2, tr = tl + 1, bl = (j + 1) * (N + 1) + i2, br = bl + 1;
-        idx.push(tl, bl, tr, tr, bl, br);
-      }
-    }
+  for (let j = 0; j < N; j++) for (let i = 0; i < N; i++) {
+    const tl = j * (N + 1) + i, tr = tl + 1, bl = (j + 1) * (N + 1) + i, br = bl + 1;
+    const visible = useWholeImage || (masks[tl] + masks[tr] + masks[bl] + masks[br]) / 4 > 0.10;
+    if (visible) indices.push(tl, bl, tr, tr, bl, br);
   }
-  if (!idx.length) throw new Error("Mesh yüzü oluşamadı — daha sade arka planlı görsel deneyin");
+  if (!indices.length) throw new Error("Görselden yüzey oluşturulamadı");
 
-  const geo = new THREE.BufferGeometry();
-  geo.setAttribute("position", new THREE.Float32BufferAttribute(pos, 3));
-  geo.setAttribute("uv", new THREE.Float32BufferAttribute(uv, 2));
-  geo.setIndex(idx);
-  geo.computeVertexNormals();
-
-  // Texture: RGBA kesme görüntüsü
-  const texCanvas = cut.toCanvas();
-  const tex = new THREE.CanvasTexture(texCanvas);
-  tex.colorSpace = THREE.SRGBColorSpace;
-
-  const mat = new THREE.MeshStandardMaterial({
-    map: tex,
-    transparent: true,
-    alphaTest: 0.4,
-    side: THREE.DoubleSide,
-    roughness: 0.85,
-    metalness: 0.0,
-    emissive: 0xffffff,
-    emissiveIntensity: 0.18,
-    emissiveMap: tex
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
+  geometry.setAttribute("uv", new THREE.Float32BufferAttribute(uvs, 2));
+  geometry.setIndex(indices);
+  geometry.computeVertexNormals();
+  const texture = new THREE.CanvasTexture(canvas);
+  texture.colorSpace = THREE.SRGBColorSpace;
+  const material = new THREE.MeshStandardMaterial({
+    map: texture, side: THREE.DoubleSide, roughness: 0.8, metalness: 0,
+    transparent: !useWholeImage, alphaTest: useWholeImage ? 0 : 0.08
   });
-  const mesh = new THREE.Mesh(geo, mat);
-  mesh.name = "local_relief";
+  const mesh = new THREE.Mesh(geometry, material);
+  mesh.name = "browser_relief";
 
-  const group = new THREE.Group();
-  group.add(mesh);
-
-  // GLB blob
-  const glb = await new Promise((resolve, reject) => {
-    new GLTFExporter().parse(
-      group,
-      (r) => resolve(new Blob([r], { type: "model/gltf-binary" })),
-      (e) => reject(e),
-      { binary: true }
-    );
-  });
-  notify("Yerel 3D model hazır (renkli, texture'lı)");
+  notify("3D dosyası hazırlanıyor…");
+  const glb = await new Promise((resolve, reject) => new GLTFExporter().parse(
+    mesh,
+    (result) => resolve(new Blob([result], { type: "model/gltf-binary" })),
+    reject,
+    { binary: true }
+  ));
+  notify("Yerel 2.5D model hazır ✓");
   return glb;
 }
 

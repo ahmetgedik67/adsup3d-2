@@ -1,15 +1,15 @@
-# Bilfen AD'S UP v2 — Çoklu Motor (TRELLIS + Hunyuan Renkli 3D)
+# Bilfen AD'S UP v2 — Tarayıcıda 3D Animasyon
 
-Öğrenciler bir görsel (çizim, fotoğraf, logo…) yükler; görsel **Tencent Hunyuan3D-2** modeliyle 3D modele dönüşür ve öğrenci, **kendi tarayıcısında dönen modeli video olarak kaydedip indirir**. Sitenin tamamı statiktir: GitHub Pages'te ücretsiz barındırılır, sunucu/anahtar gerektirmez.
+Öğrenciler bir görsel (çizim, fotoğraf, logo…) yükler; görsel **doğrudan öğrencinin tarayıcısında renkli bir 2.5D kabartmaya** dönüşür ve öğrenci, **dönen modeli video olarak kaydedip indirir**. Sitenin tamamı statiktir: GitHub Pages'te ücretsiz barındırılır, sunucu, API anahtarı, GPU kotası ve harici yapay zekâ servisi gerektirmez.
 
 ## Nasıl çalışır?
 
 1. Öğrenci görseli sürükleyip bırakır (veya tıklayarak seçer).
-2. Görsel doğrudan tarayıcıdan Hugging Face'teki resmî **`tencent/Hunyuan3D-2`** Space'inin ücretsiz API'sine gönderilir → 3D model (.glb) döner (genelde 10–60 saniye; kuyrukta bekleme olabilir).
+2. Tarayıcı görselin arka plan, renk ve ışık farklarını analiz eder; texture'lı bir 2.5D kabartma model (.glb) üretir.
 3. Model Three.js ile canlı gösterilir; otomatik döner, fareyle de çevrilebilir.
 4. **"10 saniyelik kayıt + indir"** ya da manuel kayıt düğmesiyle model MediaRecorder ile WebM videoya çevrilir, sayfada oynatılır ve **⬇ İndir** ile bilgisayara iner.
 
-Görsel hiçbir aracı sunucuya gitmez; cihaz ↔ Hugging Face arasında doğrudan akar.
+Görsel cihazdan çıkmaz ve hiçbir üçüncü taraf servisine yüklenmez.
 
 ## Opsiyonel: "Google Drive'a Kaydet" düğmesi
 
@@ -32,7 +32,7 @@ Video kartındaki **⬇ İndir** düğmesinin yanında **"☁ Drive'a Kaydet"** 
 3. 1–2 dakika sonra `https://<GitHub-kullanıcı-adı>.github.io/adsup-3d/` adresi yayında olur.
 4. Öğrenciler bu adresi tarayıcıda açar — kurulum, hesap veya anahtar gerekmez.
 
-> Not: GitHub Pages `localhost` değildir; tarayıcı CORS/HTTPS kuralları Hugging Face API'siyle sorunsuz çalışır (test edildi).
+> Not: Uygulama tamamen statiktir ve üretim tarayıcıda yapılır. GitHub Pages yalnızca site dosyalarını sunar.
 
 ## Yerel test (isteğe bağlı)
 
@@ -41,7 +41,7 @@ Python varsa: `python -m http.server 8080` de aynı işi görür.
 
 ## Sınırlar & iyi sonuç için ipuçları
 
-- Hugging Face'in ücretsiz demosunun kendi kota/bekleme sınırı vardır; yoğun saatlerde sırada bekleme olabilir. Sitede bu durum HTTPS hatası yerine net mesajla gösterilir.
+- Harici üretim servisi olmadığı için kota ve kuyruk yoktur. Hız cihazın gücüne ve görsel boyutuna bağlıdır.
 - En iyi sonuç: **sade/düz arka planlı**, tek nesne fotoğrafları (oyuncak, ürün, karakter, kendi çizimi…).
 - Çıktı videosu WebM formatındadır (Chrome/Edge ile MP4 destekli tarayıcılar otomatik MP4 seçebilir). İstenirse Windows'ta "Fotoğraflar" ya da VLC ile MP4'e dönüştürülebilir.
 - Sitede banner `assets/banner.jpg` olarak kullanılır — kendi görselinizle değiştirebilirsiniz.
@@ -49,5 +49,5 @@ Python varsa: `python -m http.server 8080` de aynı işi görür.
 ## Teknoloji
 
 - Saf HTML/CSS/JS (framework yok) + [Three.js](https://threejs.org) 0.160 (CDN'den).
-- Hunyuan3D-2 Gradio HTTP API: `POST /upload` → `POST /call/shape_generation` → SSE (`/call/shape_generation/<event_id>`) → indirme `GET /file=<path>` ( doğrulanmış akış).
+- Yerel 2.5D motor: Canvas ile renk/arka plan analizi → Three.js kabartma geometrisi → texture'lı `.glb`.
 - Video: tarayıcıda `canvas.captureStream()` + `MediaRecorder` (sunucu yok).

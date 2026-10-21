@@ -1,6 +1,5 @@
-// AD'S UP v2 — Çoklu motor: görselden RENKLİ 3D videoya
-// Zincir: Hunyuan-2 (resmî) → Hunyuan-2mv → Hunyuan-2.1 → TRELLIS
-// Her motor önce RENKLI üretimi, sonra yedek beyaz üretimi dener; kota penceresi açıkkenbirinde başarır.
+// AD'S UP v2 — görselden renkli 2.5D modele ve videoya
+// Tüm üretim öğrencinin tarayıcısında gerçekleşir; dış AI servisi ve API anahtarı yoktur.
 
 const $ = (id) => document.getElementById(id);
 const drop = $("drop"), preview = $("preview"), btnOlustur = $("btnOlustur");
@@ -37,166 +36,18 @@ function setFile(f) {
   log("Görsel seçildi: " + f.name + " (" + Math.round(f.size / 1024) + " KB)");
 }
 
-// ---------- 2) Çoklu motor API ----------
-const PROVIDERS = [
-  { name: "Hunyuan-2 (resmi)",  base: "https://tencent-hunyuan3d-2.hf.space",      v4: true,  kind: "hunyuan" },
-  { name: "Hunyuan-2mv",        base: "https://tencent-hunyuan3d-2mv.hf.space",   v4: true,  kind: "hunyuan" },
-  { name: "Hunyuan-2.1",        base: "https://tencent-hunyuan3d-2-1.hf.space",   v4: true,  kind: "hunyuan" },
-  { name: "TRELLIS",            base: "https://trellis-community-trellis.hf.space", v4: false, kind: "trellis" }
-];
-const upPath = (p) => p.v4 ? p.base + "/upload" : p.base + "/gradio_api/upload";
-const callPath = (p, fn) => p.v4 ? p.base + "/call/" + fn : p.base + "/gradio_api/call/" + fn;
-
-async function uploadTo(p, f) {
-  const fd = new FormData();
-  fd.append("files", f, f.name);
-  const r = await fetch(upPath(p), { method: "POST", body: fd });
-  if (!r.ok) throw new Error("Yükleme hatası: HTTP " + r.status);
-  const arr = await r.json();
-  return { path: arr[0], meta: { _type: "gradio.FileData" }, orig_name: f.name };
-}
-
-async function tryOne(p, fn, file, label) {
-  const fileObj = await uploadTo(p, file);
-  log("Yüklendi → " + p.name + " | " + fn);
-  const payloadData = p.kind === "trellis"
-    ? [fileObj, null, Math.floor(Math.random() * 100000), 7.5, 12, 3, 12, "stochastic", 0.95, 1024]
-    : [
-        null, fileObj, null, null, null, null,   // caption, image, multiview
-        30, 5.0, Math.floor(Math.random() * 10000),
-        256, true, 8000, true
-      ];
-  const join = await fetch(callPath(p, fn), {
-    method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ data: payloadData })
-  });
-  const j = await join.json();
-  if (!join.ok || !j.event_id) throw new Error("Kuyruk hatası: " + JSON.stringify(j).slice(0, 160));
-  setStatus(label + " kuyrukta…", 40);
-  const sse = new EventSource(callPath(p, fn) + "/" + j.event_id);
-  const result = await new Promise((resolve, reject) => {
-    let ticks = 0;
-    const timer = setInterval(() => {
-      ticks++;
-      if (ticks % 5 === 0) { let w = parseFloat(barFill.style.width) || 40; w = Math.min(80, w + 3); setStatus(label + "… " + Math.round(w) + "%", w); }
-    }, 4000);
-    sse.addEventListener("process_generating", (e) => log("…işlem: " + String(e.data || "").slice(0, 110)));
-    sse.addEventListener("complete", (e) => {
-      clearInterval(timer); sse.close();
-      try {
-        const chunks = JSON.parse(e.data);
-        const arr = Array.isArray(chunks) ? chunks : [chunks];
-        const files = [];
-        for (const c of arr) {
-          const v = c && (c.value || (c.path ? c : null));
-          if (v && (v.url || v.path)) files.push(v);
-        }
-        if (!files.length) { reject(new Error("Sonuç bulunamadı")); return; }
-        let pick;
-        if (p.kind === "hunyuan" && fn === "generation_all") {
-          pick = files.find(v => String(v.path || "").includes("textured") || String(v.orig_name || "").includes("textured")) || files[files.length - 1];
-        } else {
-          pick = files.find(v => String(v.path || v.url || "").includes(".glb")) || files[0];
-        }
-        resolve(pick);
-      } catch (err) { reject(err); }
-    });
-    sse.addEventListener("error", (e) => { clearInterval(timer); sse.close(); reject(new Error("GPU kota/kapasite reddi (SSE)")); });
-  });
-  return result;
-}
-
-const glbDownloadURLs = (p, result) => {
-  const cands = [];
-  if (result.path) {
-    cands.push((result.apiV4 ? p.base : p.base + "/gradio_api") + "/file=" + result.path);
-    cands.push(p.base + "/file=" + result.path);
-    cands.push(p.base + "/gradio_api/file=" + result.path);
-  }
-  if (result.url) cands.push(result.url);
-  return cands;
-};
-
-async function fetchGlb(p, result) {
-  setStatus("3D model indiriliyor…", 85);
-  for (const u of glbDownloadURLs(p, result)) {
-    try {
-      const blob = await (await fetch(u)).blob();
-      const head = new Uint8Array(await blob.slice(0, 4).arrayBuffer());
-      const magic = String.fromCharCode(...head);
-      if (magic === "glTF") return blob;
-      log("Uyumsuz yanıt (" + magic + ") — sonraki adrese geçiliyor");
-    } catch (e) { log("İndirme denemesi başarısız: " + u.slice(-40)); }
-  }
-  return null;
-}
-
-async function tryEngineChain(file) {
-  // Her motor: renkli üretim, sonra (sadece Hunyuan) beyaz yedek
-  let lastErr = null;
-  for (const p of PROVIDERS) {
-    const fns = p.kind === "hunyuan" ? ["generation_all", "shape_generation"] : ["generate_and_extract_glb"];
-    for (const fn of fns) {
-      try {
-        setStatus(p.name + " deneniyor…", 25);
-        log(p.name + (p.kind === "hunyuan" ? (fn === "generation_all" ? " (renkli)" : " (beyaz)") : " (renkli GLB)") + " → " + fn);
-        const result = await tryOne(p, fn, file, p.name + " üretiliyor");
-        const glbBlob = await fetchGlb(p, result);
-        if (!glbBlob) throw new Error("Model dosyası indirilemedi");
-        setStatus("Model hazır! — " + p.name, 100);
-        log("Model hazır ✓ (" + p.name + ")");
-        return glbBlob;
-      } catch (e) {
-        lastErr = e;
-        log("Başarısız [" + p.name + " / " + fn + "]: " + e.message + " → sıradaki motora geçiliyor");
-        await new Promise(r => setTimeout(r, 600));
-      }
-    }
-  }
-  throw new Error("Hugging Face GPU kotası şu anda dolu (son hata: " + (lastErr ? lastErr.message : "?") + ")");
-}
-
+// ---------- 2) Tarayıcı içi yerel 3D üretim ----------
 async function generate3D(file) {
-  setStatus("Görsel hazırlanıyor…", 10);
-  log("Yükleniyor: " + file.name);
-
-  // 1) Yerel motoru arka planda başlat — sunucu yok, kota yok, GARANTİ sonuç
-  const localTask = generateLocal3D(file)
-    .then((glb) => ({ src: "local", glb }))
-    .catch((e) => { log("Yerel motor: " + e.message); return { src: "local-err", err: e }; });
-
-  // 2) HF AI zinciri (HD renkli): 2 tur, arada 15 sn — paralel çalışıyor
-  const hfTask = (async () => {
-    let lastErr = null;
-    for (let a = 0; a < 2; a++) {
-      try { return { src: "hf", glb: await tryEngineChain(file) }; }
-      catch (e) {
-        lastErr = e;
-        if (a === 0) {
-          log("HF zinciri 1. tur: " + e.message + " → 15 sn sonra 2. tur (yerel motor paralel hazırlanıyor)");
-          await new Promise((r) => setTimeout(r, 15_000));
-        }
-      }
-    }
-    return { src: "hf-err", err: lastErr };
-  })();
-
-  // 3) Hangi motor önce biterse onu göster
-  let winner = await Promise.race([localTask, hfTask]);
-  if (winner.src === "local-err") winner = await hfTask;
-  else if (winner.src === "hf-err") winner = await localTask;
-
-  if (!winner || winner.src === "hf-err" || winner.src === "local-err") {
-    throw new Error("3D üretilemedi: " + ((winner && winner.err && winner.err.message) || "bilinmeyen") + " — daha sade görsel deneyin");
+  setStatus("Görsel tarayıcıda hazırlanıyor…", 20);
+  log("Yerel üretim başlıyor: " + file.name);
+  try {
+    const glb = await generateLocal3D(file);
+    setStatus("Model hazır! (cihazda üretildi)", 100);
+    log("Sonuç: renkli 2.5D kabartma modeli — görsel cihazdan çıkmadı");
+    return glb;
+  } catch (error) {
+    throw new Error("3D üretilemedi: " + error.message + " — daha sade veya yüksek kontrastlı bir görsel deneyin");
   }
-  if (winner.src === "hf") {
-    setStatus("Model hazır! (AI HD, renkli)", 100);
-    log("Sonuç: Hunyuan3D AI modeli (HD kalite, renkli)");
-  } else {
-    setStatus("Model hazır! (yerel motor, renkli)", 100);
-    log("Sonuç: tarayıcıda yerel üretim — sunucu yok, kota yok, herkes için çalışır");
-  }
-  return winner.glb;
 }
 
 // ---------- 3) Three.js sahne ----------
